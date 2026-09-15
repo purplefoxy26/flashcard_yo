@@ -1,0 +1,1241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Zika — Chinese vocab flashcards</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #efe8d8; min-height: 100vh; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+
+<script>
+  // Local storage-backed shim matching the window.storage API used by the
+  // component, so the app works fully offline in any browser without a backend.
+  // Data is saved to THIS browser only (per Chrome/Safari/etc. profile, per device).
+  window.storage = {
+    async get(key, shared) {
+      try {
+        var raw = localStorage.getItem("vc_" + key);
+        if (raw === null) return null;
+        return { key: key, value: raw, shared: !!shared };
+      } catch (e) { return null; }
+    },
+    async set(key, value, shared) {
+      try {
+        localStorage.setItem("vc_" + key, value);
+        return { key: key, value: value, shared: !!shared };
+      } catch (e) { return null; }
+    },
+    async delete(key, shared) {
+      try {
+        localStorage.removeItem("vc_" + key);
+        return { key: key, deleted: true, shared: !!shared };
+      } catch (e) { return null; }
+    },
+    async list(prefix, shared) {
+      try {
+        prefix = prefix || "";
+        var keys = Object.keys(localStorage)
+          .filter(function (k) { return k.indexOf("vc_" + prefix) === 0; })
+          .map(function (k) { return k.slice(3); });
+        return { keys: keys, prefix: prefix, shared: !!shared };
+      } catch (e) { return null; }
+    }
+  };
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+
+// ---- spaced-repetition schedule (days until next review, indexed by level) ----
+const INTERVALS = [0, 1, 2, 4, 7, 15, 30, 60];
+const MASTERED_LEVEL = 6;
+const LIBRARY_PAGE_SIZE = 60;
+// Persistent storage caps each key at 5MB. Leave real headroom under that
+// so a save never gets rejected mid-write.
+const STORAGE_WARN_BYTES = 3.5 * 1024 * 1024;
+const STORAGE_HARD_BYTES = 4.5 * 1024 * 1024;
+const byteSize = (obj) => new Blob([JSON.stringify(obj)]).size;
+
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate()
+  ).padStart(2, "0")}`;
+};
+
+const addDays = (dateStr, days) => {
+  const d = new Date(dateStr + "T00:00:00");
+  d.setDate(d.getDate() + days);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate()
+  ).padStart(2, "0")}`;
+};
+
+const yesterdayOf = (dateStr) => addDays(dateStr, -1);
+
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+
+const STORAGE_KEY = "chinese-vocab-data";
+const AUTO_IMPORT_FLAG_KEY = "auto-import-attempted";
+const LOCAL_VOCAB_FILE = "./preply-vocab-import.json";
+
+const emptyData = () => ({
+  words: [],
+  stats: { streak: 0, lastStudyDate: null, totalReviews: 0 },
+});
+
+function VocabApp() {
+  const [data, setData] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [tab, setTab] = useState("review");
+  const [queue, setQueue] = useState([]);
+  const [pos, setPos] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+  const [sessionReviewed, setSessionReviewed] = useState(0);
+  const [studyMode, setStudyMode] = useState(null); // 'due' | 'ahead'
+  const [search, setSearch] = useState("");
+  const [toast, setToast] = useState(null);
+  const [loadingLocal, setLoadingLocal] = useState(false);
+  const [localLoadInfo, setLocalLoadInfo] = useState(null);
+  const saveTimer = useRef(null);
+  const toastTimer = useRef(null);
+
+  const mergeWords = (baseWords, incoming) => {
+    const existingIds = new Set(baseWords.map((w) => w.id));
+    const toAdd = (incoming || []).filter((w) => w && w.hanzi && !existingIds.has(w.id));
+    const merged = [...toAdd, ...baseWords];
+    return { merged, addedCount: toAdd.length };
+  };
+
+  const loadLocalVocabFile = async (silent) => {
+    setLoadingLocal(true);
+    try {
+      const res = await fetch(LOCAL_VOCAB_FILE, { cache: "no-store" });
+      if (!res.ok) throw new Error("not found");
+      const parsed = await res.json();
+      const incoming = Array.isArray(parsed.words) ? parsed.words : [];
+      if (incoming.length === 0) {
+        if (!silent) showToast(`${LOCAL_VOCAB_FILE} has no words in it.`);
+        setLoadingLocal(false);
+        return;
+      }
+      setData((prev) => {
+        const base = prev || emptyData();
+        const { merged, addedCount } = mergeWords(base.words, incoming);
+        if (byteSize(merged) > STORAGE_HARD_BYTES) {
+          if (!silent) showToast("That file is too large to merge — storage limit reached.");
+          return prev;
+        }
+        setLocalLoadInfo({ when: todayStr(), added: addedCount, total: incoming.length });
+        if (!silent || addedCount > 0) {
+          showToast(`Loaded ${addedCount.toLocaleString()} new word${addedCount === 1 ? "" : "s"} from ${LOCAL_VOCAB_FILE}`);
+        }
+        return { ...base, words: merged };
+      });
+    } catch (e) {
+      if (!silent) showToast(`Couldn't find ${LOCAL_VOCAB_FILE} next to this page.`);
+    } finally {
+      setLoadingLocal(false);
+    }
+  };
+
+  // load
+  useEffect(() => {
+    (async () => {
+      let initial = emptyData();
+      try {
+        const res = await window.storage.get(STORAGE_KEY, false);
+        if (res && res.value) {
+          const parsed = JSON.parse(res.value);
+          initial = {
+            words: parsed.words || [],
+            stats: parsed.stats || emptyData().stats,
+          };
+        }
+      } catch (e) {
+        // keep initial as emptyData()
+      }
+      setData(initial);
+      setLoaded(true);
+
+      // Auto-import the local vocab file once, the very first time this app
+      // ever runs in this browser (so re-opening later doesn't keep re-fetching).
+      try {
+        const flag = await window.storage.get(AUTO_IMPORT_FLAG_KEY, false);
+        if (!flag) {
+          await loadLocalVocabFile(true);
+          await window.storage.set(AUTO_IMPORT_FLAG_KEY, "1", false);
+        }
+      } catch (e) {
+        // ignore — manual "Reload vocab file" button still available in Library
+      }
+    })();
+  }, []);
+
+  // save (debounced)
+  useEffect(() => {
+    if (!loaded || !data) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await window.storage.set(STORAGE_KEY, JSON.stringify(data), false);
+      } catch (e) {
+        showToast("Couldn't save — your changes may not persist.");
+      }
+    }, 300);
+    return () => clearTimeout(saveTimer.current);
+  }, [data, loaded]);
+
+  const showToast = (msg) => {
+    setToast(msg);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2600);
+  };
+
+  const dueWords = (data?.words || []).filter((w) => w.due <= todayStr());
+  const aheadWords = (data?.words || [])
+    .filter((w) => w.due > todayStr())
+    .sort((a, b) => (a.due < b.due ? -1 : 1));
+
+  const startQueue = (ids, mode) => {
+    setQueue(ids);
+    setPos(0);
+    setFlipped(false);
+    setSessionReviewed(0);
+    setStudyMode(mode);
+  };
+
+  const currentWord = () => {
+    if (!data || pos >= queue.length) return null;
+    return data.words.find((w) => w.id === queue[pos]) || null;
+  };
+
+  const recordStreak = useCallback((stats) => {
+    const today = todayStr();
+    if (stats.lastStudyDate === today) return stats;
+    if (stats.lastStudyDate === yesterdayOf(today)) {
+      return { ...stats, streak: stats.streak + 1, lastStudyDate: today };
+    }
+    return { ...stats, streak: 1, lastStudyDate: today };
+  }, []);
+
+  const grade = (result) => {
+    const word = currentWord();
+    if (!word || !data) return;
+
+    setData((prev) => {
+      const words = prev.words.map((w) => {
+        if (w.id !== word.id) return w;
+        if (result === "again") {
+          const newLevel = Math.max(0, w.level - 1);
+          return { ...w, level: newLevel, due: todayStr(), reviews: w.reviews + 1 };
+        } else {
+          const newLevel = Math.min(MASTERED_LEVEL + 1, w.level + 1);
+          const interval = INTERVALS[Math.min(newLevel, INTERVALS.length - 1)];
+          return {
+            ...w,
+            level: newLevel,
+            due: addDays(todayStr(), interval),
+            reviews: w.reviews + 1,
+          };
+        }
+      });
+      const stats = recordStreak({
+        ...prev.stats,
+        totalReviews: prev.stats.totalReviews + 1,
+      });
+      return { words, stats };
+    });
+
+    setSessionReviewed((n) => n + 1);
+
+    if (result === "again") {
+      setQueue((q) => [...q, word.id]);
+    }
+    setFlipped(false);
+    setPos((p) => p + 1);
+  };
+
+  const addWord = (word) => {
+    const candidate = {
+      id: uid(),
+      hanzi: word.hanzi,
+      pinyin: word.pinyin,
+      meaning: word.meaning,
+      example: word.example,
+      level: 0,
+      due: todayStr(),
+      reviews: 0,
+      created: todayStr(),
+    };
+    const nextWords = [candidate, ...data.words];
+    if (byteSize(nextWords) > STORAGE_HARD_BYTES) {
+      showToast("Storage is full — export a backup, then archive or delete old words to free up room.");
+      return false;
+    }
+    setData((prev) => ({ ...prev, words: nextWords }));
+    showToast(`Added ${word.hanzi} to your deck`);
+    return true;
+  };
+
+  const exportBackup = () => {
+    try {
+      const payload = JSON.stringify(data, null, 2);
+      const blob = new Blob([payload], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `zika-vocab-backup-${todayStr()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast(`Exported ${data.words.length.toLocaleString()} words`);
+    } catch (e) {
+      showToast("Couldn't export — try again.");
+    }
+  };
+
+  const importBackup = (file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        const incoming = Array.isArray(parsed.words) ? parsed.words : [];
+        if (incoming.length === 0) {
+          showToast("No words found in that file.");
+          return;
+        }
+        setData((prev) => {
+          const existingIds = new Set(prev.words.map((w) => w.id));
+          const toAdd = incoming.filter((w) => w && w.hanzi && !existingIds.has(w.id));
+          const merged = [...toAdd, ...prev.words];
+          if (byteSize(merged) > STORAGE_HARD_BYTES) {
+            showToast("That backup is too large to merge — storage limit reached.");
+            return prev;
+          }
+          showToast(`Imported ${toAdd.length.toLocaleString()} new word${toAdd.length === 1 ? "" : "s"}`);
+          return { ...prev, words: merged };
+        });
+      } catch (e) {
+        showToast("Couldn't read that file — is it a Zìkǎ backup?");
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const deleteWord = (id) => {
+    setData((prev) => ({ ...prev, words: prev.words.filter((w) => w.id !== id) }));
+    setQueue((q) => q.filter((qid) => qid !== id));
+  };
+
+  if (!loaded || !data) {
+    return (
+      <div className="vc-root vc-loading">
+        <style>{CSS}</style>
+        <div className="vc-loading-mark">字</div>
+      </div>
+    );
+  }
+
+  const inSession = studyMode !== null && pos < queue.length;
+  const sessionDone = studyMode !== null && pos >= queue.length && queue.length > 0;
+
+  return (
+    <div className="vc-root">
+      <style>{CSS}</style>
+
+      <header className="vc-header">
+        <div className="vc-brand">
+          <span className="vc-seal">字</span>
+          <div>
+            <div className="vc-brand-name">Zìkǎ</div>
+            <div className="vc-brand-sub">word cards</div>
+          </div>
+        </div>
+        <div className="vc-header-stats">
+          <div className="vc-stat">
+            <span className="vc-stat-num">{dueWords.length}</span>
+            <span className="vc-stat-label">due today</span>
+          </div>
+          <div className="vc-stat">
+            <span className="vc-stat-num">{data.stats.streak}</span>
+            <span className="vc-stat-label">day streak</span>
+          </div>
+          <div className="vc-stat">
+            <span className="vc-stat-num">{data.words.length.toLocaleString()}</span>
+            <span className="vc-stat-label">total words</span>
+          </div>
+        </div>
+      </header>
+
+      <nav className="vc-tabs">
+        {[
+          ["review", "Review"],
+          ["library", "Library"],
+          ["add", "Add word"],
+        ].map(([key, label]) => (
+          <button
+            key={key}
+            className={"vc-tab" + (tab === key ? " vc-tab-active" : "")}
+            onClick={() => {
+              setTab(key);
+              setStudyMode(null);
+            }}
+          >
+            {label}
+            {key === "review" && dueWords.length > 0 && (
+              <span className="vc-tab-badge">{dueWords.length}</span>
+            )}
+          </button>
+        ))}
+      </nav>
+
+      <main className="vc-main">
+        {tab === "review" && !inSession && !sessionDone && (
+          <ReviewStart
+            dueCount={dueWords.length}
+            aheadCount={aheadWords.length}
+            totalCount={data.words.length}
+            onStartDue={() => startQueue(dueWords.map((w) => w.id), "due")}
+            onStartAhead={() =>
+              startQueue(aheadWords.slice(0, 15).map((w) => w.id), "ahead")
+            }
+          />
+        )}
+
+        {tab === "review" && inSession && (
+          <ReviewSession
+            word={currentWord()}
+            flipped={flipped}
+            setFlipped={setFlipped}
+            onGrade={grade}
+            pos={pos}
+            total={queue.length}
+          />
+        )}
+
+        {tab === "review" && sessionDone && (
+          <div className="vc-empty">
+            <div className="vc-empty-mark">好</div>
+            <h2 className="vc-empty-title">Session complete</h2>
+            <p className="vc-empty-text">
+              You reviewed {sessionReviewed} card{sessionReviewed === 1 ? "" : "s"}
+              {studyMode === "due" ? " due today." : " ahead of schedule."}
+            </p>
+            <div className="vc-empty-actions">
+              {studyMode === "due" && aheadWords.length > 0 && (
+                <button
+                  className="vc-btn vc-btn-ghost"
+                  onClick={() =>
+                    startQueue(aheadWords.slice(0, 15).map((w) => w.id), "ahead")
+                  }
+                >
+                  Practice more (not due yet)
+                </button>
+              )}
+              <button
+                className="vc-btn vc-btn-primary"
+                onClick={() => {
+                  setStudyMode(null);
+                  setTab("library");
+                }}
+              >
+                View library
+              </button>
+            </div>
+          </div>
+        )}
+
+        {tab === "library" && (
+          <Library
+            words={data.words}
+            search={search}
+            setSearch={setSearch}
+            onDelete={deleteWord}
+            onExport={exportBackup}
+            onImport={importBackup}
+            storageBytes={byteSize(data.words)}
+            warnBytes={STORAGE_WARN_BYTES}
+            hardBytes={STORAGE_HARD_BYTES}
+            loadingLocal={loadingLocal}
+            localLoadInfo={localLoadInfo}
+            onLoadLocal={() => loadLocalVocabFile(false)}
+          />
+        )}
+
+        {tab === "add" && <AddWord onAdd={addWord} onDoneAdd={() => setTab("library")} />}
+      </main>
+
+      {toast && <div className="vc-toast">{toast}</div>}
+    </div>
+  );
+}
+
+function ReviewStart({ dueCount, aheadCount, totalCount, onStartDue, onStartAhead }) {
+  if (totalCount === 0) {
+    return (
+      <div className="vc-empty">
+        <div className="vc-empty-mark">加</div>
+        <h2 className="vc-empty-title">Your deck is empty</h2>
+        <p className="vc-empty-text">
+          Add your first word to start building a review queue.
+        </p>
+      </div>
+    );
+  }
+  if (dueCount === 0) {
+    return (
+      <div className="vc-empty">
+        <div className="vc-empty-mark">好</div>
+        <h2 className="vc-empty-title">All caught up</h2>
+        <p className="vc-empty-text">
+          Nothing is due today. Come back tomorrow, or practice ahead of schedule.
+        </p>
+        {aheadCount > 0 && (
+          <div className="vc-empty-actions">
+            <button className="vc-btn vc-btn-primary" onClick={onStartAhead}>
+              Practice {Math.min(aheadCount, 15)} words early
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
+  return (
+    <div className="vc-empty">
+      <div className="vc-empty-mark">{dueCount}</div>
+      <h2 className="vc-empty-title">
+        {dueCount} card{dueCount === 1 ? "" : "s"} due today
+      </h2>
+      <p className="vc-empty-text">Work through your queue, one word at a time.</p>
+      <div className="vc-empty-actions">
+        <button className="vc-btn vc-btn-primary" onClick={onStartDue}>
+          Start review
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ReviewSession({ word, flipped, setFlipped, onGrade, pos, total }) {
+  if (!word) return null;
+  return (
+    <div className="vc-session">
+      <div className="vc-progress-track">
+        <div
+          className="vc-progress-fill"
+          style={{ width: `${(pos / total) * 100}%` }}
+        />
+      </div>
+      <div className="vc-progress-count">
+        {pos + 1} / {total}
+      </div>
+
+      <div
+        className={"vc-card" + (flipped ? " vc-card-flipped" : "")}
+        onClick={() => !flipped && setFlipped(true)}
+      >
+        <div className="vc-card-inner">
+          <div className="vc-card-face vc-card-front">
+            <div className="vc-hanzi">{word.hanzi}</div>
+            <div className="vc-tap-hint">Tap to reveal</div>
+          </div>
+          <div className="vc-card-face vc-card-back">
+            <div className="vc-hanzi vc-hanzi-small">{word.hanzi}</div>
+            <div className="vc-pinyin">{word.pinyin || "—"}</div>
+            <div className="vc-meaning">{word.meaning}</div>
+            {word.example && <div className="vc-example">{word.example}</div>}
+          </div>
+        </div>
+      </div>
+
+      {flipped ? (
+        <div className="vc-grade-row">
+          <button
+            className="vc-grade-btn vc-grade-again"
+            onClick={() => onGrade("again")}
+          >
+            Still learning
+          </button>
+          <button
+            className="vc-grade-btn vc-grade-good"
+            onClick={() => onGrade("good")}
+          >
+            Got it
+          </button>
+        </div>
+      ) : (
+        <button className="vc-btn vc-btn-ghost vc-reveal-btn" onClick={() => setFlipped(true)}>
+          Show answer
+        </button>
+      )}
+    </div>
+  );
+}
+
+function Library({
+  words,
+  search,
+  setSearch,
+  onDelete,
+  onExport,
+  onImport,
+  storageBytes,
+  warnBytes,
+  hardBytes,
+  loadingLocal,
+  localLoadInfo,
+  onLoadLocal,
+}) {
+  const [visibleCount, setVisibleCount] = useState(LIBRARY_PAGE_SIZE);
+  const fileInputRef = useRef(null);
+
+  const filtered = words.filter((w) => {
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      w.hanzi.toLowerCase().includes(q) ||
+      (w.pinyin || "").toLowerCase().includes(q) ||
+      w.meaning.toLowerCase().includes(q) ||
+      (w.tag || "").toLowerCase().includes(q)
+    );
+  });
+
+  const sorted = [...filtered].sort((a, b) => (a.due < b.due ? -1 : 1));
+  const visible = sorted.slice(0, visibleCount);
+  const usagePct = Math.min(100, Math.round((storageBytes / hardBytes) * 100));
+  const nearLimit = storageBytes >= warnBytes;
+  const missingExamples = words.filter((w) => !w.example).length;
+
+  useEffect(() => {
+    setVisibleCount(LIBRARY_PAGE_SIZE);
+  }, [search]);
+
+  if (words.length === 0) {
+    return (
+      <div className="vc-empty">
+        <div className="vc-empty-mark">空</div>
+        <h2 className="vc-empty-title">No words yet</h2>
+        <p className="vc-empty-text">
+          Words you add will show up here with their progress. Restoring on a new
+          device or browser? Import a backup to bring your deck over.
+        </p>
+        <div className="vc-empty-actions">
+          <button
+            className="vc-btn vc-btn-ghost"
+            onClick={() => fileInputRef.current && fileInputRef.current.click()}
+          >
+            Import backup
+          </button>
+        </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="application/json"
+          className="vc-file-input"
+          onChange={(e) => {
+            const file = e.target.files && e.target.files[0];
+            if (file) onImport(file);
+            e.target.value = "";
+          }}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="vc-library">
+      <div className="vc-lib-toolbar">
+        <button className="vc-btn vc-btn-ghost vc-toolbar-btn" onClick={onExport}>
+          Export backup
+        </button>
+        <button
+          className="vc-btn vc-btn-ghost vc-toolbar-btn"
+          onClick={() => fileInputRef.current && fileInputRef.current.click()}
+        >
+          Import backup
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="application/json"
+          className="vc-file-input"
+          onChange={(e) => {
+            const file = e.target.files && e.target.files[0];
+            if (file) onImport(file);
+            e.target.value = "";
+          }}
+        />
+      </div>
+
+      <div className="vc-fill-bar">
+        <div className="vc-fill-row">
+          <button
+            className="vc-btn vc-btn-ghost vc-toolbar-btn"
+            onClick={onLoadLocal}
+            disabled={loadingLocal}
+          >
+            {loadingLocal ? "Loading…" : `Reload ${LOCAL_VOCAB_FILE.replace("./", "")}`}
+          </button>
+          {missingExamples > 0 && (
+            <span className="vc-storage-label vc-fill-missing">
+              {missingExamples.toLocaleString()} word{missingExamples === 1 ? "" : "s"} still
+              missing an example
+            </span>
+          )}
+        </div>
+        {localLoadInfo && (
+          <div className="vc-storage-label">
+            Last loaded {localLoadInfo.added.toLocaleString()} new word
+            {localLoadInfo.added === 1 ? "" : "s"} from the file ({localLoadInfo.total.toLocaleString()} total in it)
+          </div>
+        )}
+      </div>
+
+      {nearLimit && (
+        <div className="vc-storage-bar">
+          <div className="vc-storage-track">
+            <div className="vc-storage-fill" style={{ width: `${usagePct}%` }} />
+          </div>
+          <div className="vc-storage-label">
+            Storage {usagePct}% full — export a backup and delete old words if you're
+            adding many more.
+          </div>
+        </div>
+      )}
+
+      <input
+        className="vc-search"
+        placeholder="Search characters, pinyin, or meaning"
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+      />
+      <div className="vc-lib-count">
+        {sorted.length.toLocaleString()} word{sorted.length === 1 ? "" : "s"}
+        {search.trim() ? " matched" : " total"}
+      </div>
+      <div className="vc-lib-list">
+        {visible.map((w) => (
+          <div className="vc-lib-row" key={w.id}>
+            <div className="vc-lib-hanzi">{w.hanzi}</div>
+            <div className="vc-lib-info">
+              <div className="vc-lib-top">
+                <span className="vc-lib-pinyin">{w.pinyin}</span>
+                {w.tag && <span className="vc-source-tag">{w.tag}</span>}
+                {w.level > MASTERED_LEVEL && (
+                  <span className="vc-mastered-tag">mastered</span>
+                )}
+                {!w.example && <span className="vc-noex-tag">no example</span>}
+              </div>
+              <div className="vc-lib-meaning">{w.meaning}</div>
+            </div>
+            <div className="vc-lib-progress">
+              <div className="vc-dots">
+                {Array.from({ length: 5 }).map((_, i) => (
+                  <span
+                    key={i}
+                    className={
+                      "vc-dot" + (i < Math.min(w.level, 5) ? " vc-dot-filled" : "")
+                    }
+                  />
+                ))}
+              </div>
+              <div className="vc-lib-due">
+                {w.due <= todayStr() ? "due now" : `due ${w.due.slice(5)}`}
+              </div>
+            </div>
+            <button
+              className="vc-delete-btn"
+              onClick={() => onDelete(w.id)}
+              aria-label={`Delete ${w.hanzi}`}
+              title="Delete"
+            >
+              ×
+            </button>
+          </div>
+        ))}
+        {sorted.length === 0 && (
+          <div className="vc-no-results">No words match “{search}”.</div>
+        )}
+      </div>
+      {visibleCount < sorted.length && (
+        <button
+          className="vc-btn vc-btn-ghost vc-load-more"
+          onClick={() => setVisibleCount((n) => n + LIBRARY_PAGE_SIZE)}
+        >
+          Load {Math.min(LIBRARY_PAGE_SIZE, sorted.length - visibleCount)} more
+          ({sorted.length - visibleCount} remaining)
+        </button>
+      )}
+    </div>
+  );
+}
+
+function AddWord({ onAdd, onDoneAdd }) {
+  const [hanzi, setHanzi] = useState("");
+  const [pinyin, setPinyin] = useState("");
+  const [meaning, setMeaning] = useState("");
+  const [example, setExample] = useState("");
+  const [justAdded, setJustAdded] = useState(false);
+  const [blocked, setBlocked] = useState(false);
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!hanzi.trim() || !meaning.trim()) return;
+    const ok = onAdd({
+      hanzi: hanzi.trim(),
+      pinyin: pinyin.trim(),
+      meaning: meaning.trim(),
+      example: example.trim(),
+    });
+    if (ok === false) {
+      setBlocked(true);
+      return;
+    }
+    setBlocked(false);
+    setHanzi("");
+    setPinyin("");
+    setMeaning("");
+    setExample("");
+    setJustAdded(true);
+    setTimeout(() => setJustAdded(false), 1800);
+  };
+
+  return (
+    <div className="vc-add">
+      <form className="vc-form" onSubmit={submit}>
+        <label className="vc-field">
+          <span className="vc-field-label">Characters</span>
+          <input
+            className="vc-input vc-input-hanzi"
+            value={hanzi}
+            onChange={(e) => setHanzi(e.target.value)}
+            placeholder="你好"
+            required
+          />
+        </label>
+        <label className="vc-field">
+          <span className="vc-field-label">Pinyin</span>
+          <input
+            className="vc-input"
+            value={pinyin}
+            onChange={(e) => setPinyin(e.target.value)}
+            placeholder="nǐ hǎo"
+          />
+        </label>
+        <label className="vc-field">
+          <span className="vc-field-label">Meaning</span>
+          <input
+            className="vc-input"
+            value={meaning}
+            onChange={(e) => setMeaning(e.target.value)}
+            placeholder="hello"
+            required
+          />
+        </label>
+        <label className="vc-field">
+          <span className="vc-field-label">Example sentence (optional)</span>
+          <textarea
+            className="vc-input vc-textarea"
+            value={example}
+            onChange={(e) => setExample(e.target.value)}
+            placeholder="你好，你叫什么名字？"
+            rows={2}
+          />
+        </label>
+        <button className="vc-btn vc-btn-primary vc-add-submit" type="submit">
+          Add to deck
+        </button>
+        {justAdded && <div className="vc-add-confirm">Added — keep going.</div>}
+        {blocked && (
+          <div className="vc-add-warning">
+            Storage is full. Go to Library to export a backup and free up room.
+          </div>
+        )}
+      </form>
+    </div>
+  );
+}
+
+const CSS = `
+:root {
+  --paper: #efe8d8;
+  --paper-card: #fbf8f1;
+  --ink: #21201c;
+  --ink-soft: #55524a;
+  --seal: #a3352d;
+  --seal-soft: #c9a29a;
+  --jade: #45624f;
+  --jade-soft: #cddccf;
+  --gold: #a67f2e;
+  --line: #d8cfba;
+}
+
+.vc-root {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: Georgia, "Songti SC", "Noto Serif SC", serif;
+  min-height: 100%;
+  padding: 28px 20px 40px;
+  box-sizing: border-box;
+  max-width: 640px;
+  margin: 0 auto;
+  position: relative;
+}
+
+.vc-loading { display: flex; align-items: center; justify-content: center; min-height: 320px; }
+.vc-loading-mark {
+  font-size: 3rem;
+  color: var(--seal-soft);
+  animation: vc-pulse 1.4s ease-in-out infinite;
+}
+@keyframes vc-pulse { 0%,100% { opacity: .35; } 50% { opacity: .9; } }
+
+.vc-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 18px;
+  margin-bottom: 18px;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+.vc-brand { display: flex; align-items: center; gap: 10px; }
+.vc-seal {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  background: var(--seal);
+  color: var(--paper-card);
+  font-size: 1.3rem;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.vc-brand-name { font-size: 1.3rem; line-height: 1.1; }
+.vc-brand-sub {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.72rem;
+  color: var(--ink-soft);
+  letter-spacing: 0.03em;
+}
+.vc-header-stats { display: flex; gap: 22px; }
+.vc-stat { display: flex; flex-direction: column; align-items: center; min-width: 44px; }
+.vc-stat-num { font-size: 1.25rem; font-weight: 600; }
+.vc-stat-cap { font-size: 0.78rem; font-weight: 400; color: var(--ink-soft); }
+.vc-stat-label {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.66rem;
+  color: var(--ink-soft);
+}
+
+.vc-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 22px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.vc-tab {
+  border: none;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 0.92rem;
+  padding: 8px 14px;
+  border-radius: 999px;
+  cursor: pointer;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.vc-tab:hover { color: var(--ink); }
+.vc-tab-active {
+  background: var(--ink);
+  color: var(--paper-card);
+}
+.vc-tab-badge {
+  background: var(--seal);
+  color: var(--paper-card);
+  font-size: 0.66rem;
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+.vc-tab-active .vc-tab-badge { background: var(--paper-card); color: var(--ink); }
+
+.vc-main { min-height: 320px; }
+
+.vc-empty {
+  text-align: center;
+  padding: 48px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.vc-empty-mark {
+  font-size: 2.4rem;
+  color: var(--seal);
+  margin-bottom: 10px;
+}
+.vc-empty-title { margin: 0 0 8px; font-size: 1.35rem; }
+.vc-empty-text {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ink-soft);
+  max-width: 340px;
+  line-height: 1.5;
+  margin: 0 0 20px;
+  font-size: 0.92rem;
+}
+.vc-empty-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+
+.vc-btn {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.92rem;
+  padding: 11px 22px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.vc-btn-primary { background: var(--ink); color: var(--paper-card); }
+.vc-btn-primary:hover { background: #35322a; }
+.vc-btn-ghost { background: transparent; border-color: var(--line); color: var(--ink); }
+.vc-btn-ghost:hover { border-color: var(--ink-soft); }
+
+.vc-session { display: flex; flex-direction: column; align-items: center; }
+.vc-progress-track {
+  width: 100%;
+  height: 3px;
+  background: var(--line);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.vc-progress-fill { height: 100%; background: var(--seal); transition: width .25s ease; }
+.vc-progress-count {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.72rem;
+  color: var(--ink-soft);
+  margin: 8px 0 22px;
+}
+
+.vc-card {
+  width: 100%;
+  max-width: 380px;
+  height: 260px;
+  perspective: 1200px;
+  cursor: pointer;
+}
+.vc-card-inner {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  transition: transform .5s cubic-bezier(.4,.2,.2,1);
+  transform-style: preserve-3d;
+}
+.vc-card-flipped .vc-card-inner { transform: rotateY(180deg); }
+.vc-card-face {
+  position: absolute;
+  inset: 0;
+  backface-visibility: hidden;
+  background: var(--paper-card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  box-sizing: border-box;
+  text-align: center;
+}
+.vc-card-back { transform: rotateY(180deg); gap: 6px; }
+.vc-hanzi { font-size: 4.2rem; line-height: 1; }
+.vc-hanzi-small { font-size: 2.4rem; margin-bottom: 4px; }
+.vc-tap-hint {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.76rem;
+  color: var(--ink-soft);
+  margin-top: 18px;
+}
+.vc-pinyin { color: var(--gold); font-size: 1.15rem; }
+.vc-meaning { font-size: 1.35rem; margin-top: 4px; }
+.vc-example {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.86rem;
+  color: var(--ink-soft);
+  margin-top: 10px;
+  max-width: 300px;
+}
+
+.vc-reveal-btn { margin-top: 24px; }
+.vc-grade-row { display: flex; gap: 12px; margin-top: 24px; width: 100%; max-width: 380px; }
+.vc-grade-btn {
+  flex: 1;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.92rem;
+  padding: 13px 10px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+}
+.vc-grade-again { background: var(--seal-soft); color: #5c2620; }
+.vc-grade-again:hover { background: #d9b3ab; }
+.vc-grade-good { background: var(--jade); color: var(--paper-card); }
+.vc-grade-good:hover { background: #37503f; }
+
+.vc-library { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.vc-lib-toolbar { display: flex; gap: 8px; margin-bottom: 14px; }
+.vc-toolbar-btn { padding: 8px 14px; font-size: 0.82rem; }
+.vc-file-input { display: none; }
+.vc-storage-bar { margin-bottom: 16px; }
+.vc-storage-track {
+  width: 100%;
+  height: 5px;
+  background: var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.vc-storage-fill { height: 100%; background: var(--gold); transition: width .3s ease; }
+.vc-storage-label { font-size: 0.74rem; color: var(--ink-soft); margin-top: 6px; }
+.vc-search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--paper-card);
+  font-size: 0.9rem;
+  margin-bottom: 16px;
+  color: var(--ink);
+}
+.vc-search:focus { outline: 2px solid var(--gold); outline-offset: 1px; }
+.vc-lib-count { font-size: 0.76rem; color: var(--ink-soft); margin-bottom: 10px; }
+.vc-lib-list { display: flex; flex-direction: column; gap: 8px; }
+.vc-load-more { width: 100%; margin-top: 14px; }
+.vc-lib-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: var(--paper-card);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+.vc-lib-hanzi { font-family: Georgia, "Songti SC", serif; font-size: 1.6rem; width: 52px; flex-shrink: 0; }
+.vc-lib-info { flex: 1; min-width: 0; }
+.vc-lib-top { display: flex; align-items: center; gap: 8px; }
+.vc-lib-pinyin { color: var(--gold); font-size: 0.86rem; }
+.vc-mastered-tag {
+  font-size: 0.62rem;
+  background: var(--jade-soft);
+  color: var(--jade);
+  padding: 1px 7px;
+  border-radius: 999px;
+}
+.vc-source-tag {
+  font-size: 0.62rem;
+  background: #ddd3f0;
+  color: #5a3d99;
+  padding: 1px 7px;
+  border-radius: 999px;
+}
+.vc-noex-tag {
+  font-size: 0.62rem;
+  background: var(--seal-soft);
+  color: #7a3a32;
+  padding: 1px 7px;
+  border-radius: 999px;
+}
+.vc-fill-bar { margin-bottom: 16px; }
+.vc-fill-missing { margin-left: 4px; }
+.vc-toolbar-btn:disabled { opacity: 0.6; cursor: default; }
+.vc-fill-row { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; }
+.vc-fill-stop { padding: 4px 12px; font-size: 0.74rem; }
+.vc-fill-fill { background: var(--jade); }
+.vc-lib-meaning { font-size: 0.88rem; color: var(--ink-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vc-lib-progress { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
+.vc-dots { display: flex; gap: 3px; }
+.vc-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--line); }
+.vc-dot-filled { background: var(--jade); }
+.vc-lib-due { font-size: 0.66rem; color: var(--ink-soft); }
+.vc-delete-btn {
+  border: none;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 1.3rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 4px;
+  flex-shrink: 0;
+}
+.vc-delete-btn:hover { color: var(--seal); }
+.vc-no-results { text-align: center; color: var(--ink-soft); padding: 30px 0; font-size: 0.9rem; }
+
+.vc-add { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.vc-form { display: flex; flex-direction: column; gap: 16px; max-width: 420px; }
+.vc-field { display: flex; flex-direction: column; gap: 6px; }
+.vc-field-label { font-size: 0.78rem; color: var(--ink-soft); }
+.vc-input {
+  font-family: Georgia, "Songti SC", serif;
+  font-size: 1rem;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--paper-card);
+  color: var(--ink);
+  box-sizing: border-box;
+}
+.vc-input:focus { outline: 2px solid var(--gold); outline-offset: 1px; }
+.vc-input-hanzi { font-size: 1.6rem; }
+.vc-textarea { font-size: 0.92rem; resize: vertical; }
+.vc-add-submit { margin-top: 4px; }
+.vc-add-confirm {
+  font-size: 0.82rem;
+  color: var(--jade);
+  margin-top: -6px;
+}
+.vc-add-warning {
+  font-size: 0.78rem;
+  color: var(--gold);
+  margin-top: -6px;
+}
+
+.vc-toast {
+  position: fixed;
+  bottom: 22px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--ink);
+  color: var(--paper-card);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.85rem;
+  padding: 10px 18px;
+  border-radius: 999px;
+  box-shadow: 0 6px 18px rgba(0,0,0,.25);
+  z-index: 50;
+}
+
+@media (max-width: 420px) {
+  .vc-header-stats { gap: 14px; }
+  .vc-card { height: 230px; }
+  .vc-hanzi { font-size: 3.4rem; }
+}
+`;
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<VocabApp />);
+</script>
+</body>
+</html>
